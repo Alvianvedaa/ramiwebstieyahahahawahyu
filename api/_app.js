@@ -14,6 +14,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const olsera = require('../olsera-client');
+const gopay = require('../gopay-client');
 
 /* ------------------------------------------------------------------ */
 /* 1. Konfigurasi                                                      */
@@ -422,7 +423,9 @@ api.post(
         if (total <= 0) return res.status(400).json({ error: 'Total pesanan tidak valid' });
 
         const id = req.body.id || `RAMI-${Date.now().toString(36).toUpperCase()}`;
-        const paymentStatus = req.body.paymentStatus || (req.body.paymentMethod === 'Bayar di tempat' ? 'unpaid' : 'paid');
+        const isQris = (req.body.paymentMethod || 'QRIS').toUpperCase() === 'QRIS';
+        // Pesanan QRIS WAJIB 'unpaid' dulu sampai terbayar di GoPay Merchant
+        const paymentStatus = isQris ? 'unpaid' : (req.body.paymentStatus || 'unpaid');
         
         const order = {
             ...req.body,
@@ -472,11 +475,146 @@ api.post(
         await addLog(`Pesanan baru ${id} dari ${customer.name}`);
 
         const sync = await syncOrder(order);
+
+        // Buat data transaksi GoPay / QRIS jika metode pembayaran QRIS
+        let qrisData = null;
+        if (isQris) {
+            try {
+                qrisData = await gopay.createQrisTransaction({
+                    orderId: id,
+                    amount: total,
+                    customerName: customer.name,
+                    customerPhone: customer.phone,
+                    items: normalizedItems,
+                });
+            } catch (err) {
+                console.error('Gagal generate QRIS GoPay:', err.message);
+            }
+        }
         
         // Fetch saved order with items
         const { data: savedOrderRow } = await supabase.from('orders').select('*, order_items(*)').eq('id', id).single();
         
-        res.status(201).json({ order: mapDBToOrder(savedOrderRow), olsera: sync });
+        res.status(201).json({
+            order: mapDBToOrder(savedOrderRow),
+            olsera: sync,
+            qris: qrisData
+        });
+    })
+);
+
+/* --- Endpoint Cek Status Pembayaran Realtime (Polling Storefront) --- */
+api.get(
+    '/orders/:id/payment-status',
+    wrap(async (req, res) => {
+        const { data: orderRow, error: fetchError } = await supabase
+            .from('orders')
+            .select('*, order_items(*)')
+            .eq('id', req.params.id)
+            .single();
+
+        if (fetchError || !orderRow) {
+            return res.status(404).json({ error: 'Order tidak ditemukan' });
+        }
+
+        // Jika di database sudah tercatat lunas
+        if (orderRow.payment_status === 'paid') {
+            return res.json({
+                ok: true,
+                paid: true,
+                status: 'paid',
+                paidAt: orderRow.paid_at,
+                order: mapDBToOrder(orderRow)
+            });
+        }
+
+        // Cek langsung ke server GoPay / Midtrans jika menggunakan dynamic gateway
+        const gatewayStatus = await gopay.checkPaymentStatus(req.params.id);
+        if (gatewayStatus.paid) {
+            const paidAt = gatewayStatus.paidAt || new Date().toISOString();
+            const updateData = { payment_status: 'paid', paid_at: paidAt };
+            await supabase.from('orders').update(updateData).eq('id', req.params.id);
+
+            const order = mapDBToOrder({ ...orderRow, ...updateData });
+            await syncOrder(order); // otomatis update kasir Olsera ke LUNAS & Confirmed
+            await addLog(`Pembayaran GoPay/QRIS untuk ${order.id} terkonfirmasi otomatis ✓`, 'ok');
+
+            const { data: finalOrder } = await supabase.from('orders').select('*, order_items(*)').eq('id', req.params.id).single();
+            return res.json({
+                ok: true,
+                paid: true,
+                status: 'paid',
+                paidAt,
+                order: mapDBToOrder(finalOrder)
+            });
+        }
+
+        return res.json({
+            ok: true,
+            paid: false,
+            status: orderRow.payment_status || 'unpaid',
+            order: mapDBToOrder(orderRow)
+        });
+    })
+);
+
+/* --- Webhook GoPay Merchant / Midtrans Callback (Realtime Push) --- */
+api.post(
+    '/webhook/gopay',
+    wrap(async (req, res) => {
+        const body = req.body || {};
+        const isValid = gopay.verifyWebhookSignature(body);
+        if (!isValid) {
+            return res.status(403).json({ error: 'Invalid signature' });
+        }
+
+        const orderId = body.order_id;
+        const txStatus = (body.transaction_status || '').toLowerCase();
+        const isPaid = txStatus === 'settlement' || txStatus === 'capture';
+
+        if (orderId && isPaid) {
+            const { data: orderRow } = await supabase.from('orders').select('*, order_items(*)').eq('id', orderId).single();
+            if (orderRow && orderRow.payment_status !== 'paid') {
+                const updateData = { payment_status: 'paid', paid_at: body.settlement_time || new Date().toISOString() };
+                await supabase.from('orders').update(updateData).eq('id', orderId);
+
+                const order = mapDBToOrder({ ...orderRow, ...updateData });
+                await syncOrder(order); // sync status lunas ke Olsera POS
+                await addLog(`Webhook GoPay: Order ${orderId} lunas (${body.payment_type || 'qris'}) ✓`, 'ok');
+            }
+        }
+
+        res.json({ status: 'OK' });
+    })
+);
+
+api.post(
+    '/webhook/midtrans',
+    (req, res, next) => {
+        req.url = '/webhook/gopay';
+        api.handle(req, res, next);
+    }
+);
+
+/* --- Simulasi Pembayaran (Untuk Uji Coba Pengembang) --- */
+api.post(
+    '/payment/simulate-pay',
+    wrap(async (req, res) => {
+        const { orderId } = req.body || {};
+        if (!orderId) return res.status(400).json({ error: 'orderId wajib diisi' });
+
+        const { data: orderRow } = await supabase.from('orders').select('*, order_items(*)').eq('id', orderId).single();
+        if (!orderRow) return res.status(404).json({ error: 'Order tidak ditemukan' });
+
+        const updateData = { payment_status: 'paid', paid_at: new Date().toISOString() };
+        await supabase.from('orders').update(updateData).eq('id', orderId);
+
+        const order = mapDBToOrder({ ...orderRow, ...updateData });
+        const synced = await syncOrder(order);
+        await addLog(`Simulasi Pembayaran: Order ${orderId} ditandai Lunas ✓`, 'ok');
+
+        const { data: finalOrder } = await supabase.from('orders').select('*, order_items(*)').eq('id', orderId).single();
+        res.json({ ok: true, paid: true, order: mapDBToOrder(finalOrder), olsera: synced });
     })
 );
 
